@@ -146,19 +146,8 @@ class MpsWereadMP(MpsWeread):
         return max(float(cfg.get("weread.page_interval", 1) or 0), 0)
 
     def _request_headers(self, include_ticket=False):
-        headers = {
-            "Cookie": self._weread_cookies,
-            "User-Agent": self.user_agent,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Origin": "https://weread.qq.com",
-            "Referer": "https://weread.qq.com/",
-        }
-        if include_ticket and self._weread_ticket:
-            # 新版微信读书已弃用 x-wr-ticket，仅需有效 Cookie 即可拉取文章列表；
-            # 保留旧逻辑以便兼容旧版微信读书。无 ticket 时不拦截请求。
-            headers["x-wr-ticket"] = self._weread_ticket
-        return headers
+        """已并入基类 ``_weread_headers``，保留此方法仅作兼容别名。"""
+        return self._weread_headers(include_ticket=include_ticket)
 
     def _get_mp_articles_page(self, book_id: str, offset=0):
         # /web/mp/articles 曾在部分旧 Cookie 上返回 -2041，当时据此回退到 cover 方案；

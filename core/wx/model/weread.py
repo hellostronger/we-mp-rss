@@ -130,6 +130,26 @@ class MpsWeread(WxGather):
         self._weread_name = acc.get("name", "")
         return True
 
+    def _weread_headers(self, include_ticket=False) -> dict:
+        """构造微信读书 web 域请求头（当前生效账号的 Cookie）。
+
+        所有微信读书请求都必须经过这里，避免 Cookie/请求头在多处副本里
+        各改一处、漏一处（旧实现曾让 ``_request_headers`` 变成死代码）。
+        """
+        headers = {
+            "Cookie": self._weread_cookies,
+            "User-Agent": self.user_agent,
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Origin": "https://weread.qq.com",
+            "Referer": "https://weread.qq.com/",
+        }
+        if include_ticket and self._weread_ticket:
+            # 新版微信读书已弃用 x-wr-ticket，仅需有效 Cookie 即可拉取文章列表；
+            # 保留旧逻辑以便兼容旧版微信读书。无 ticket 时不拦截请求。
+            headers["x-wr-ticket"] = self._weread_ticket
+        return headers
+
     def _weread_http_get(self, url: str, params: dict = None, include_ticket=False, timeout=(10, 30)):
         """GET 请求微信读书 API，带多账号配额 failover。
 
@@ -143,16 +163,7 @@ class MpsWeread(WxGather):
 
         tried_accounts = set()
         while True:
-            headers = {
-                "Cookie": self._weread_cookies,
-                "User-Agent": self.user_agent,
-                "Accept": "application/json, text/plain, */*",
-                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Origin": "https://weread.qq.com",
-                "Referer": "https://weread.qq.com/",
-            }
-            if include_ticket and self._weread_ticket:
-                headers["x-wr-ticket"] = self._weread_ticket
+            headers = self._weread_headers(include_ticket=include_ticket)
 
             try:
                 resp = requests.get(

@@ -3,7 +3,6 @@
 import time
 from urllib.parse import quote
 
-import requests
 from bs4 import BeautifulSoup
 
 from core.log import logger
@@ -164,15 +163,17 @@ class MpsWereadMP(MpsWeread):
     def _get_mp_articles_page(self, book_id: str, offset=0):
         # /web/mp/articles 曾在部分旧 Cookie 上返回 -2041，当时据此回退到 cover 方案；
         # 实测该列表接口可用，是增量补抓的主路径。失败时由 get_Articles 回退 cover。
+        # 内部走 _weread_http_get，带多账号配额 failover。
         try:
-            response = requests.get(
+            response = self._weread_http_get(
                 f"{WEREAD_WEB_BASE}/web/mp/articles",
                 params={"bookId": book_id, "offset": offset},
-                headers=self._request_headers(include_ticket=True),
-                proxies=self._get_proxies(),
-                timeout=(10, 30),
+                include_ticket=True,
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
+            from core.wx.model.weread_mp import WereadMPAPIError
+            if isinstance(exc, WereadMPAPIError):
+                raise
             raise WereadMPAPIError("network_error", str(exc)) from exc
         if response.status_code != 200:
             raise WereadMPAPIError(
@@ -194,14 +195,13 @@ class MpsWereadMP(MpsWeread):
         返回: {"name", "title", "pic", "reviewId", ...}；无文章或接口异常时抛错。
         """
         try:
-            response = requests.get(
+            response = self._weread_http_get(
                 f"{WEREAD_WEB_BASE}/api/mp/cover",
                 params={"bookId": book_id},
-                headers=self._request_headers(),
-                proxies=self._get_proxies(),
-                timeout=(10, 30),
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
+            if isinstance(exc, WereadMPAPIError):
+                raise
             raise WereadMPAPIError("network_error", str(exc)) from exc
         if response.status_code != 200:
             raise WereadMPAPIError(
@@ -248,17 +248,14 @@ class MpsWereadMP(MpsWeread):
             session.close()
 
     def _get_mp_content(self, review_id: str):
-        headers = self._request_headers()
-        headers["Accept"] = "text/html,application/xhtml+xml,*/*"
         try:
-            response = requests.get(
+            response = self._weread_http_get(
                 f"{WEREAD_WEB_BASE}/web/mp/content",
                 params={"reviewId": review_id},
-                headers=headers,
-                proxies=self._get_proxies(),
-                timeout=(10, 30),
             )
-        except requests.RequestException as exc:
+        except Exception as exc:
+            if isinstance(exc, WereadMPAPIError):
+                raise
             raise WereadMPAPIError("network_error", str(exc)) from exc
         if response.status_code != 200:
             raise WereadMPAPIError(

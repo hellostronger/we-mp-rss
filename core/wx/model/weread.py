@@ -58,9 +58,16 @@ class MpsWeread(WxGather):
         self._weread_ticket: str = ""
         self._weread_vid: str = ""
         self._weread_name: str = ""
+        # 多账号：wx.lic 的 weread_data.accounts 数组，或包装单账号旧格式
+        self._weread_accounts: list = []
+        self._current_account_idx: int = 0
 
     def _load_weread_auth(self):
-        """加载微信读书的 Cookie"""
+        """加载微信读书的 Cookie
+
+        支持多账号：``weread_data.accounts`` 为数组，每个元素是独立 cookie/vid/name。
+        旧版单账号 ``weread_data.cookie`` 格式自动兼容。
+        """
         from core.config import Config, cfg as app_cfg
         import os
 
@@ -78,33 +85,130 @@ class MpsWeread(WxGather):
             except Exception:
                 weread_data = {}
 
-        self._weread_cookies = app_cfg.get("weread.cookie", "") or weread_data.get("cookie", "")
-        self._weread_ticket = app_cfg.get("weread.ticket", "") or weread_data.get("ticket", "")
-        self._weread_vid = app_cfg.get("weread.vid", "") or weread_data.get("vid", "")
-        self._weread_name = weread_data.get("name", "")
+        # 构建多账号列表：兼容单账号旧格式
+        accounts = weread_data.get("accounts", None)
+        if accounts and isinstance(accounts, list):
+            self._weread_accounts = accounts
+        else:
+            # 单账号旧格式 → 包装成列表
+            if weread_data.get("cookie"):
+                self._weread_accounts = [weread_data]
+            else:
+                self._weread_accounts = []
+
+        # 选择当前激活账号：优先 env 变量覆盖，否则用第一个
+        self._current_account_idx = 0
+        self._weread_cookies = app_cfg.get("weread.cookie", "") or (
+            self._weread_accounts[0].get("cookie", "") if self._weread_accounts else ""
+        )
+        self._weread_ticket = app_cfg.get("weread.ticket", "") or (
+            self._weread_accounts[0].get("ticket", "") if self._weread_accounts else ""
+        )
+        self._weread_vid = app_cfg.get("weread.vid", "") or (
+            self._weread_accounts[0].get("vid", "") if self._weread_accounts else ""
+        )
+        self._weread_name = (
+            self._weread_accounts[0].get("name", "") if self._weread_accounts else ""
+        )
+
+    def _switch_weread_account(self) -> bool:
+        """切换到下一个微信读书账号（round-robin）。
+
+        返回 ``True`` 表示成功切到了**不同**的账号；
+        ``False`` 表示只有一个账号或已切回原点。
+        """
+        if len(self._weread_accounts) <= 1:
+            return False
+        prev_idx = self._current_account_idx
+        self._current_account_idx = (self._current_account_idx + 1) % len(
+            self._weread_accounts
+        )
+        acc = self._weread_accounts[self._current_account_idx]
+        self._weread_cookies = acc.get("cookie", "")
+        self._weread_ticket = acc.get("ticket", "")
+        self._weread_vid = acc.get("vid", "")
+        self._weread_name = acc.get("name", "")
+        return True
+
+    def _weread_http_get(self, url: str, params: dict = None, include_ticket=False, timeout=(10, 30)):
+        """GET 请求微信读书 API，带多账号配额 failover。
+
+        检测到配额耗尽（HTTP 499 / errcode -2014 / -2041 / -2012）时，
+        自动切换到 ``wx.lic`` 中下一个账号并重试。
+
+        返回值：``requests.Response`` 对象（像 ``requests.get`` 一样使用）。
+        """
+        import requests
+        from core.wx.model.weread_mp import WereadMPAPIError
+
+        tried_accounts = set()
+        while True:
+            headers = {
+                "Cookie": self._weread_cookies,
+                "User-Agent": self.user_agent,
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Origin": "https://weread.qq.com",
+                "Referer": "https://weread.qq.com/",
+            }
+            if include_ticket and self._weread_ticket:
+                headers["x-wr-ticket"] = self._weread_ticket
+
+            try:
+                resp = requests.get(
+                    url, params=params, headers=headers,
+                    proxies=self._get_proxies(), timeout=timeout,
+                )
+            except requests.exceptions.Timeout:
+                raise WereadMPAPIError("timeout", f"{url}") from None
+            except requests.RequestException as exc:
+                raise WereadMPAPIError("network_error", str(exc)) from exc
+
+            # 检查响应中的配额耗尽信号
+            is_quota_exhausted = False
+            if resp.status_code == 499:
+                is_quota_exhausted = True
+            elif resp.status_code == 200:
+                try:
+                    payload = resp.json()
+                    code = payload.get("errcode", payload.get("errCode", 0))
+                    if code in (-2014, -2041, -2012):
+                        is_quota_exhausted = True
+                except (ValueError, AttributeError):
+                    pass
+
+            if is_quota_exhausted:
+                if self._current_account_idx not in tried_accounts:
+                    tried_accounts.add(self._current_account_idx)
+                idx_before = self._current_account_idx
+                if self._switch_weread_account() and self._current_account_idx not in tried_accounts:
+                    logger.info(
+                        f"配额耗尽（当前账号 {idx_before}），"
+                        f"切换到账号 {self._current_account_idx}（{self._weread_name or '未命名'}）重试"
+                    )
+                    continue
+                # 所有账号都试过了
+                raise WereadMPAPIError(
+                    499 if resp.status_code == 499 else (code if 'code' in locals() else -2041),
+                    f"所有账号配额均已耗尽（{len(tried_accounts)} 个）",
+                    retriable=False,
+                )
+
+            return resp
 
     def _weread_get(self, url: str, params: dict = None) -> Optional[dict]:
-        """带微信读书 Cookie 的 GET 请求（web 域，浏览器完整请求头）"""
-        import requests
+        """带微信读书 Cookie 的 GET 请求（web 域，浏览器完整请求头）
 
-        headers = {
-            "Cookie": self._weread_cookies,
-            "User-Agent": self.user_agent,
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Origin": "https://weread.qq.com",
-            "Referer": "https://weread.qq.com/",
-        }
+        内部走 ``_weread_http_get``，带多账号配额 failover。
+        """
+        try:
+            resp = self._weread_http_get(url, params=params, timeout=15)
+        except Exception:
+            return None
 
         try:
-            proxies = self._get_proxies()
-            resp = requests.get(
-                url, params=params, headers=headers, proxies=proxies, timeout=15
-            )
             if resp.status_code == 200:
                 payload = resp.json()
-                # 微信读书以 HTTP 200 返回业务错误（登录态失效等），
-                # 必须检查 errcode，否则「登录超时」会被当成空书架（0 本书）
                 errcode = payload.get("errCode", payload.get("errcode", 0))
                 if errcode in (-2012, -2010, -2041):
                     print_warning(
@@ -123,9 +227,6 @@ class MpsWeread(WxGather):
             else:
                 print_warning(f"Weread API 返回 {resp.status_code}: {url}")
                 return None
-        except requests.exceptions.Timeout:
-            print_warning(f"Weread API 超时: {url}")
-            return None
         except Exception as e:
             print_warning(f"Weread API 异常: {e}")
             return None

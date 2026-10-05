@@ -61,6 +61,9 @@ class MpsWeread(WxGather):
         # 多账号：wx.lic 的 weread_data.accounts 数组，或包装单账号旧格式
         self._weread_accounts: list = []
         self._current_account_idx: int = 0
+        # 最近一次失败是否**所有账号配额都耗尽**。用于把「配额耗尽」和
+        # 「登录态失效」在报错里区分开 —— 两者在 API 层同码（-2012）。
+        self._weread_quota_exhausted: bool = False
 
     def _load_weread_auth(self):
         """加载微信读书的 Cookie
@@ -161,6 +164,7 @@ class MpsWeread(WxGather):
         import requests
         from core.wx.model.weread_mp import WereadMPAPIError
 
+        self._weread_quota_exhausted = False
         tried_accounts = set()
         while True:
             headers = self._weread_headers(include_ticket=include_ticket)
@@ -199,12 +203,14 @@ class MpsWeread(WxGather):
                     )
                     continue
                 # 所有账号都试过了
+                self._weread_quota_exhausted = True
                 raise WereadMPAPIError(
                     499 if resp.status_code == 499 else (code if 'code' in locals() else -2041),
                     f"所有账号配额均已耗尽（{len(tried_accounts)} 个）",
                     retriable=False,
                 )
 
+            self._weread_quota_exhausted = False
             return resp
 
     def _weread_get(self, url: str, params: dict = None) -> Optional[dict]:
@@ -636,6 +642,13 @@ class MpsWeread(WxGather):
         """
         测试微信读书认证是否有效
         返回: {"ok": bool, "name": str, "vid": str, "book_count": int, "error": str}
+
+        ⚠️ 不要把这里的所有失败都写成「Cookie 可能已过期」（2026-10-06 修正）：
+        实测配额耗尽时 `/web/shelf/sync` 会返回 `-2012 登录态失效`，与真正的
+        登录过期**完全同码**。旧实现一律报「Cookie 可能已过期」，导致用户
+        反复重扫 Cookie —— 而重扫根本没用（配额按 `wr_vid` 计，与 Cookie 有效期
+        无关；实测同一 Cookie 换出口 IP 结果一致）。现在按「是否所有账号都耗尽」
+        分开报。
         """
         self.get_token()  # 加载基础配置
         self._load_weread_auth()
@@ -651,7 +664,18 @@ class MpsWeread(WxGather):
 
         books = self._get_shelf_books()
         if books is None:
-            return {"ok": False, "name": "", "vid": self._weread_vid, "book_count": 0, "error": "API 请求失败，Cookie 可能已过期"}
+            n = len(self._weread_accounts)
+            if self._weread_quota_exhausted:
+                if n > 1:
+                    hint = (f"（已尝试全部 {n} 个账号）"
+                            f"；可稍后重试或用「扫码授权」再绑一个微信号分流配额")
+                else:
+                    hint = ("；这是**配额耗尽**不是 Cookie 过期 —— 配额按微信账号计算，"
+                            "重扫同一个微信号无效，请稍后重试或添加第二个账号")
+                return {"ok": False, "name": "", "vid": self._weread_vid, "book_count": 0,
+                        "error": f"微信读书访问配额已耗尽{hint}"}
+            return {"ok": False, "name": "", "vid": self._weread_vid, "book_count": 0,
+                    "error": "微信读书 API 请求失败（网络或 Cookie 失效），请重新扫码授权"}
 
         # 尝试获取用户名
         name = self._weread_name

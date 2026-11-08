@@ -113,6 +113,9 @@ class MpsWeread(WxGather):
         self._weread_name = (
             self._weread_accounts[0].get("name", "") if self._weread_accounts else ""
         )
+        # 最近一次 _weread_get 的失败原因（"" = 成功/未调用），
+        # 供 ensure_mp_on_shelf / bookshelf API 输出真实错误
+        self._last_fetch_error = ""
 
     def _switch_weread_account(self) -> bool:
         """切换到下一个微信读书账号（round-robin）。
@@ -217,10 +220,26 @@ class MpsWeread(WxGather):
         """带微信读书 Cookie 的 GET 请求（web 域，浏览器完整请求头）
 
         内部走 ``_weread_http_get``，带多账号配额 failover。
+
+        失败时把真实原因写入 ``self._last_fetch_error``（供 ensure_mp_on_shelf
+        等调用方直接引用），不再静默吞异常 —— 旧版 ``except Exception: return
+        None`` 什么都不打，2026-11-08 16:00 整轮书架检查全失败却零告警，
+        上层只能瞎猜「Cookie 可能已过期」；9 分钟后同一接口正常返回 14 本书，
+        Cookie 根本没过期。
         """
+        from core.wx.model.weread_mp import WereadMPAPIError
+
+        self._last_fetch_error = ""
         try:
             resp = self._weread_http_get(url, params=params, timeout=15)
-        except Exception:
+        except WereadMPAPIError as exc:
+            # 超时/网络异常/所有账号配额耗尽（failover 抛出的都是它）
+            self._last_fetch_error = str(exc)
+            print_warning(f"Weread API 请求失败: {exc}")
+            return None
+        except Exception as e:
+            self._last_fetch_error = f"{type(e).__name__}: {e}"
+            print_warning(f"Weread API 异常: {self._last_fetch_error}")
             return None
 
         try:
@@ -228,6 +247,12 @@ class MpsWeread(WxGather):
                 payload = resp.json()
                 errcode = payload.get("errCode", payload.get("errcode", 0))
                 if errcode in (-2012, -2010, -2041):
+                    # ⚠️ 同码歧义（见 test_auth 的 2026-10-06 注释）：配额耗尽
+                    # 也返回 -2012，与真正登录过期无法从 errcode 区分。
+                    self._last_fetch_error = (
+                        f"登录态失效或配额耗尽(errCode={errcode}: "
+                        f"{payload.get('errmsg') or payload.get('errlog') or errcode})"
+                    )
                     print_warning(
                         "Weread API 登录态失效: "
                         f"{payload.get('errmsg') or payload.get('errlog') or errcode}"
@@ -236,16 +261,19 @@ class MpsWeread(WxGather):
                     return None
                 return payload
             elif resp.status_code == 401 or resp.status_code == 403:
+                self._last_fetch_error = f"认证失败(HTTP {resp.status_code})，Cookie 已过期或无效"
                 print_warning(
                     f"Weread API 认证失败: {resp.status_code}（Cookie 已过期或无效，"
                     "请在「微信读书管理」页重新扫码授权）"
                 )
                 return None
             else:
+                self._last_fetch_error = f"HTTP {resp.status_code}: {url}"
                 print_warning(f"Weread API 返回 {resp.status_code}: {url}")
                 return None
         except Exception as e:
-            print_warning(f"Weread API 异常: {e}")
+            self._last_fetch_error = f"{type(e).__name__}: {e}"
+            print_warning(f"Weread API 异常: {self._last_fetch_error}")
             return None
 
     def _get_shelf_books(self) -> List[Dict]:
@@ -366,8 +394,17 @@ class MpsWeread(WxGather):
 
         shelf = self._get_shelf_books()
         if shelf is None:
-            # 与「空书架」区分：请求失败/登录态失效
-            return False, "书架获取失败（Cookie 可能已过期），无法确认书架状态"
+            # 与「空书架」区分：请求失败/登录态失效。带上 _weread_get 记录的真实
+            # 原因（超时/网络/配额耗尽/登录失效），不再一律瞎猜「Cookie 可能已过期」
+            # —— 2026-11-08 16:00 整轮瞬时失败全被报成 Cookie 过期，误导排查。
+            # 瞬时失败（超时/网络）重试一次再下结论，避免整轮误报。
+            reason = getattr(self, "_last_fetch_error", "")
+            if reason and not any(kw in reason for kw in ("登录", "认证", "配额")):
+                print_info(f"书架获取瞬时失败({reason})，重试一次")
+                shelf = self._get_shelf_books()
+            if shelf is None:
+                reason = getattr(self, "_last_fetch_error", "") or "未知原因"
+                return False, f"书架获取失败: {reason}"
         if any(b["book_id"] == book_id for b in shelf):
             return True, "已在书架"
         if not self._weread_vid:

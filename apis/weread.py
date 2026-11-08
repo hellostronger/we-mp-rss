@@ -354,7 +354,10 @@ async def get_bookshelf(current_user=Depends(get_current_user_or_ak)):
 
     books = wx._get_shelf_books()
     if books is None:
-        return error_response(500, "获取书架失败，Cookie 可能已过期")
+        # 带上 _weread_get 记录的真实原因（超时/网络/配额耗尽/登录失效），
+        # 不再一律报「Cookie 可能已过期」误导用户重扫（2026-11-08 修正）
+        reason = getattr(wx, "_last_fetch_error", "") or "未知原因"
+        return error_response(500, f"获取书架失败: {reason}")
 
     return success_response({
         "total": len(books),

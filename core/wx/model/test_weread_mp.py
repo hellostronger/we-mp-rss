@@ -154,6 +154,46 @@ class WereadMpRequestTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("登录态失效", detail)
 
+    @patch("core.wx.model.weread.MpsWeread._get_shelf_books")
+    def test_ensure_mp_on_shelf_retries_transient_failure(self, shelf):
+        """瞬时失败（超时/网络）重试一次，第二次成功 → 正常继续。"""
+        shelf.side_effect = [None, [{"book_id": "MP_WXS_1", "title": "t"}]]
+        collector = self.make_collector_with_vid()
+        collector._last_fetch_error = "WeRead MP API error timeout: /web/shelf/sync"
+
+        ok, detail = collector.ensure_mp_on_shelf("MP_WXS_1", "Name")
+
+        self.assertTrue(ok)
+        self.assertEqual(detail, "已在书架")
+        self.assertEqual(shelf.call_count, 2)
+
+    @patch("core.wx.model.weread.MpsWeread._get_shelf_books")
+    def test_ensure_mp_on_shelf_no_retry_on_login_error(self, shelf):
+        """登录/认证/配额类失败不重试，且报真实原因而非「Cookie 可能已过期」。"""
+        shelf.return_value = None
+        collector = self.make_collector_with_vid()
+        collector._last_fetch_error = "登录态失效或配额耗尽(errCode=-2012: login expired)"
+
+        ok, detail = collector.ensure_mp_on_shelf("MP_WXS_1", "Name")
+
+        self.assertFalse(ok)
+        self.assertIn("errCode=-2012", detail)
+        self.assertNotIn("可能已过期", detail)
+        self.assertEqual(shelf.call_count, 1)
+
+    @patch("core.wx.model.weread.MpsWeread._get_shelf_books")
+    def test_ensure_mp_on_shelf_reports_reason_after_retry(self, shelf):
+        """重试仍失败 → ok=False 且 detail 带真实原因。"""
+        shelf.return_value = None
+        collector = self.make_collector_with_vid()
+        collector._last_fetch_error = "WeRead MP API error timeout: /web/shelf/sync"
+
+        ok, detail = collector.ensure_mp_on_shelf("MP_WXS_1", "Name")
+
+        self.assertFalse(ok)
+        self.assertIn("timeout", detail)
+        self.assertEqual(shelf.call_count, 2)
+
     def test_ensure_mp_on_shelf_skips_non_mp(self):
         collector = self.make_collector_with_vid()
 
